@@ -1,64 +1,73 @@
-from collections import OrderedDict
 from functools import partial
 import tqdm
 import torch
 import torch.nn as nn
-from torch import optim
-from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 import os
-
-# 导入数据加载器（假设包含训练集和测试集）
-from dataloader import train_dataloader
 
 
 # ---------------------- 1. 带空洞卷积的图像分块嵌入模块 ----------------------
 class patched(nn.Module):
     def __init__(self, imgsize=224, patch_size=16, in_channels=3, embed_dim=512,
-                 norm_layer=None, dilation=2):  # 新增dilation参数（空洞率）
+                 norm_layer=None):  # 移除dilation参数（深度可分离卷积无需空洞率）
         super().__init__()
         img_size = (imgsize, imgsize)
         patch_size = (patch_size, patch_size)
         self.patch_size = patch_size
         self.img_size = img_size
-        self.dilation = dilation  # 空洞率（1=普通卷积，2=空洞卷积）
 
-        # 关键计算：空洞卷积的有效核大小和填充（确保输出尺寸与普通卷积一致）
-        # 有效核大小 = 物理核大小 + (物理核大小-1)*(dilation-1)
-        effective_kernel_h = patch_size[0] + (patch_size[0] - 1) * (dilation - 1)
-        effective_kernel_w = patch_size[1] + (patch_size[1] - 1) * (dilation - 1)
-
-        # 计算填充：补偿空洞导致的尺寸缩减，确保输出网格大小仍为14x14
-        padding_h = (effective_kernel_h - patch_size[0]) // 2
-        padding_w = (effective_kernel_w - patch_size[1]) // 2
+        # 深度可分离卷积无需空洞率，直接计算普通卷积的填充（确保输出尺寸与原分块逻辑一致）
+        # 目标：输出特征图尺寸 = (img_size - patch_size) / stride + 1 = (224-16)/16 +1 =14x14
+        padding_h = (patch_size[0] - 1) // 2  # 普通卷积填充公式（保持边缘信息）
+        padding_w = (patch_size[1] - 1) // 2
         self.padding = (padding_h, padding_w)
 
-        # 计算分块网格大小（必须与原普通卷积一致，否则位置嵌入维度错误）
+        # 计算分块网格大小（必须为14x14，与原逻辑一致）
         self.grid_size = (
-            (img_size[0] + 2 * padding_h - effective_kernel_h) // patch_size[0] + 1,
-            (img_size[1] + 2 * padding_w - effective_kernel_w) // patch_size[1] + 1
+            (img_size[0] + 2 * padding_h - patch_size[0]) // patch_size[0] + 1,
+            (img_size[1] + 2 * padding_w - patch_size[1]) // patch_size[1] + 1
         )
-        self.num_patches = self.grid_size[0] * self.grid_size[1]  # 应保持14*14=196
+        self.num_patches = self.grid_size[0] * self.grid_size[1]  # 14*14=196，确保与原模型兼容
 
-        # 空洞卷积替换普通卷积（核心修改）
-        self.proj = nn.Conv2d(
+        # ---------------------- 核心修改：深度可分离卷积替换原卷积 ----------------------
+        # 1. 深度卷积（Depth-wise Convolution）：逐通道独立卷积，保持通道数不变
+        #    groups=in_channels 表示每个输入通道用独立卷积核处理
+        self.depth_conv = nn.Conv2d(
             in_channels=in_channels,
-            out_channels=embed_dim,
+            out_channels=in_channels,  # 输出通道数=输入通道数（仅逐通道卷积）
             kernel_size=patch_size,
-            stride=patch_size,  # 步长仍为patch_size，确保分块数量不变
+            stride=patch_size,  # 步长=patch_size，确保分块数量不变
             padding=self.padding,
-            dilation=dilation  # 空洞率
+            groups=in_channels  # 关键：深度卷积的分组数=输入通道数
         )
+
+        # 2. 逐点卷积（Point-wise Convolution）：1x1卷积融合通道，映射到目标嵌入维度
+        self.point_conv = nn.Conv2d(
+            in_channels=in_channels,  # 输入=深度卷积的输出通道数（in_channels）
+            out_channels=embed_dim,  # 输出=目标嵌入维度（512）
+            kernel_size=1,  # 1x1卷积，仅融合通道
+            stride=1,
+            padding=0
+        )
+
+        # 组合深度卷积和逐点卷积为proj（替代原单一卷积）
+        self.proj = nn.Sequential(
+            self.depth_conv,
+            nn.BatchNorm2d(in_channels),
+            nn.GELU(),
+            self.point_conv
+        )
+
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
         B, C, H, W = x.shape
         assert H == self.img_size[0] and W == self.img_size[1], \
             f'输入图像大小{H}*{W}与模型期望{self.img_size[0]}*{self.img_size[1]}不匹配'
-        # 空洞卷积分块+展平：输出形状仍为 (B, num_patches, embed_dim)
-        x = self.proj(x).flatten(2).transpose(1, 2)
+
+        # 深度可分离卷积分块+展平：输出形状仍为 (B, num_patches, embed_dim)
+        x = self.proj(x).flatten(2).transpose(1, 2)  # 与原逻辑完全兼容
         x = self.norm(x)
         return x
-
 
 # ---------------------- 2. 注意力模块（保持不变） ----------------------
 class attention(nn.Module):
@@ -165,10 +174,9 @@ class block(nn.Module):
 
 # ---------------------- 5. 完整Vision Transformer（带空洞卷积和MoE） ----------------------
 class VisionTransformer(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channel=3, num_classes=100, embed_dim=512,
-                 depth=8, num_heads=8, mlp_ratio=4.0, qkv_bias=True, qk_scale=None,
-                 representation_size=None, norm_layer=nn.RMSNorm, attn_drop=0, drop_ratio=0,
-                 embed_layer=patched, act_layer=None, num_experts=8, top_k=2, dilation=2):
+    def __init__(self, img_size=224, patch_size=16, in_channel=3, num_classes=100, embed_dim=256,
+                 depth=6, num_heads=4, mlp_ratio=4.0, qkv_bias=True, qk_scale=None, norm_layer=nn.RMSNorm, attn_drop=0, drop_ratio=0,
+                 embed_layer=patched, act_layer=None, num_experts=8, top_k=2):
         super().__init__()
         self.num_classes = num_classes
         self.num_tokens = 1  # 仅用cls_token
@@ -178,7 +186,7 @@ class VisionTransformer(nn.Module):
         # 图像分块嵌入（使用带空洞卷积的embed_layer）
         self.embed_layer = embed_layer(
             imgsize=img_size, patch_size=patch_size, in_channels=in_channel,
-            embed_dim=embed_dim, norm_layer=norm_layer, dilation=dilation  # 传递空洞率
+            embed_dim=embed_dim, norm_layer=norm_layer, # 传递空洞率
         )
         num_patches = self.embed_layer.num_patches  # 应保持196
 
@@ -242,161 +250,15 @@ class VisionTransformer(nn.Module):
 
 
 # ---------------------- 6. 模型构建函数（指定空洞率和MoE参数） ----------------------
-def vit_base_patch16_224_moe(classes=100, num_experts=8, top_k=2, dilation=2, **kwargs):
+def vit_base_patch16_224_moe(num_experts,top_k,classes=100,img_size=224, patch_size=16, in_channel=3,
+        embed_dim=512, depth=4, num_heads=8, mlp_ratio=2.0):
     return VisionTransformer(
         img_size=224, patch_size=16, in_channel=3, num_classes=classes,
-        embed_dim=512, depth=8, num_heads=8, mlp_ratio=4.0,
-        num_experts=num_experts, top_k=top_k, dilation=dilation,  # 传递空洞率和MoE参数
-        **kwargs
+        embed_dim=512, depth=4, num_heads=8, mlp_ratio=2.0,
+        num_experts=num_experts, top_k=top_k,
     )
 
 
-# ---------------------- 7. 训练函数（含最优模型保存） ----------------------
-def train_model(model, train_loader, criterion, optimizer, lr_scheduler, num_epochs, device,
-                save_path='./models/best_model.pth'):
-    model.train()
-    best_acc = 0.0
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        current_lr = optimizer.param_groups[0]['lr']
-
-        loop = tqdm.tqdm(
-            enumerate(train_loader),
-            total=len(train_loader),
-            desc=f"Epoch {epoch + 1}/{num_epochs} | LR: {current_lr:.6f}",
-            leave=True
-        )
-
-        for batch_idx, (images, labels) in loop:
-            images, labels = images.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
-            # 计算准确率
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-
-            # 反向传播
-            loss.backward()
-            optimizer.step()
-
-            # 更新进度条
-            running_loss += loss.item()
-            batch_avg_loss = running_loss / (batch_idx + 1)
-            avg_acc = 100 * correct / total
-            batch_acc = 100 * (predicted == labels).sum().item() / labels.size(0)
-            loop.set_postfix({
-                "batch_loss": f"{loss.item():.4f}",
-                "avg_loss": f"{batch_avg_loss:.4f}",
-                "batch_acc": f"{batch_acc:.2f}%",
-                "avg_acc": f"{avg_acc:.2f}%"
-            })
-
-        # 调整学习率
-        lr_scheduler.step()
-
-        # 计算epoch指标
-        epoch_avg_loss = running_loss / len(train_loader)
-        epoch_avg_acc = 100 * correct / total
-
-        # 保存最优模型
-        if epoch_avg_acc > best_acc:
-            best_acc = epoch_avg_acc
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_acc': best_acc,
-                'loss': epoch_avg_loss
-            }, save_path)
-            print(f"✅ 最优模型已保存 | 最高准确率: {best_acc:.2f}% | 路径: {save_path}")
-
-        print(
-            f"\nEpoch {epoch + 1} 完成 | 平均损失: {epoch_avg_loss:.4f} | 平均准确率: {epoch_avg_acc:.2f}% | 历史最高: {best_acc:.2f}%\n")
 
 
-# ---------------------- 8. 预测函数（测试集评估） ----------------------
-def predict(model, test_loader, device, model_path=None):
-    if model_path and os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"📥 加载模型 | 保存时准确率: {checkpoint['best_acc']:.2f}% | Epoch: {checkpoint['epoch']}")
-
-    model.eval()
-    all_preds = []
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        loop = tqdm.tqdm(enumerate(test_loader), total=len(test_loader), desc="Testing")
-        for batch_idx, (images, labels) in loop:
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            _, predicted = torch.max(outputs, 1)
-
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-            test_acc = 100 * correct / total
-            all_preds.extend(predicted.cpu().numpy().tolist())
-
-            loop.set_postfix({"test_acc": f"{test_acc:.2f}%"})
-
-    print(f"\n📊 测试完成 | 总样本: {total} | 准确率: {test_acc:.2f}%")
-    return all_preds, test_acc
-
-
-# ---------------------- 9. 主函数（启动训练和测试） ----------------------
-if __name__ == "__main__":
-    # 设备配置
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
-
-    # 初始化模型（含空洞卷积和MoE）
-    model = vit_base_patch16_224_moe(
-        classes=100,
-        num_experts=8,  # MoE专家数量
-        top_k=2,  # 每个样本选择的专家数
-        dilation=2  # 空洞率（1=普通卷积，2=空洞卷积）
-    ).to(device)
-
-    # 数据加载器
-    train_loader = train_dataloader
-
-
-    # 优化器和学习率调度器
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=5e-4,
-        weight_decay=0.0001,
-        betas=(0.9, 0.999),
-        eps=1e-08
-    )
-    # 学习率策略：5个epoch warmup + 45个epoch余弦退火
-    warmup_epochs = 5
-    main_epochs = 50 - warmup_epochs
-    warmup_scheduler = LambdaLR(optimizer, lr_lambda=lambda e: (e + 1) / warmup_epochs)
-    main_scheduler = CosineAnnealingLR(optimizer, T_max=main_epochs, eta_min=1e-6)
-    lr_scheduler = SequentialLR(optimizer, [warmup_scheduler, main_scheduler], [warmup_epochs])
-
-    # 损失函数
-    criterion = nn.CrossEntropyLoss().to(device)
-
-    # 启动训练
-    train_model(
-        model=model,
-        train_loader=train_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        num_epochs=50,
-        device=device,
-        save_path='./models/best_moe_vit_dilated.pth'
-    )
 
